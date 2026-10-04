@@ -15,8 +15,8 @@ export async function exportVideoClip({
   return new Promise(async (resolve, reject) => {
     try {
       // Determine canvas dimensions based on aspect ratio
-      let width = 720;
-      let height = 1280; // 9:16 vertical shorts default
+      let width = 1080;
+      let height = 1920; // 9:16 vertical shorts default Full HD
 
       if (aspectRatio === "1:1") {
         width = 1080;
@@ -75,7 +75,7 @@ export async function exportVideoClip({
         console.warn("Could not capture direct audio track, proceeding with video stream", err);
       }
 
-      const recorderOptions = selectedMime ? { mimeType: selectedMime, videoBitsPerSecond: 4000000 } : {};
+      const recorderOptions = selectedMime ? { mimeType: selectedMime, videoBitsPerSecond: 8000000 } : {};
       const recorder = new MediaRecorder(stream, recorderOptions);
       const recordedChunks = [];
 
@@ -139,11 +139,10 @@ export async function exportVideoClip({
         if (!isRecording) return;
 
         let currentVideoTime = startTime;
-        if (hasDirectVideo) {
+        const elapsedSecs = (now - renderStartTime) / 1000;
+        if (hasDirectVideo && !videoElement.paused && Math.abs(videoElement.currentTime - startTime) > 0.01) {
           currentVideoTime = videoElement.currentTime;
         } else {
-          // Timer-driven simulation for YouTube / external sources
-          const elapsedSecs = (now - renderStartTime) / 1000;
           currentVideoTime = startTime + elapsedSecs;
         }
 
@@ -218,42 +217,7 @@ export async function exportVideoClip({
           ctx.restore();
         }
 
-        // Draw Top Headline Hook Banner if set
-        if (headline && headline.trim()) {
-          ctx.save();
-          const bannerY = aspectRatio === "9:16" ? 140 : 60;
-          let bannerFontSize = 32;
-          ctx.font = `800 ${bannerFontSize}px 'Plus Jakarta Sans', Inter, sans-serif`;
-          let textWidth = ctx.measureText(headline.toUpperCase()).width;
 
-          // Dynamically scale down font if headline is too long
-          while (textWidth > width * 0.82 && bannerFontSize > 18) {
-            bannerFontSize -= 2;
-            ctx.font = `800 ${bannerFontSize}px 'Plus Jakarta Sans', Inter, sans-serif`;
-            textWidth = ctx.measureText(headline.toUpperCase()).width;
-          }
-
-          ctx.textAlign = "center";
-          ctx.textBaseline = "middle";
-
-          const pillPadding = 24;
-          const pillHeight = bannerFontSize * 1.8;
-
-          // Banner pill background
-          ctx.fillStyle = "rgba(0, 0, 0, 0.8)";
-          ctx.beginPath();
-          ctx.roundRect((width - textWidth - pillPadding * 2) / 2, bannerY - pillHeight / 2, textWidth + pillPadding * 2, pillHeight, 30);
-          ctx.fill();
-
-          ctx.strokeStyle = "#ff007a";
-          ctx.lineWidth = 3;
-          ctx.stroke();
-
-          // Text
-          ctx.fillStyle = "#FFFFFF";
-          ctx.fillText(headline.toUpperCase(), width / 2, bannerY);
-          ctx.restore();
-        }
 
         // Draw Brand Logo Watermark (only if explicitly enabled in Brand Kit)
         if (logoImg && logoImg.complete && logoImg.naturalWidth > 0) {
@@ -436,13 +400,17 @@ export async function exportVideoClip({
       function finishRecording() {
         if (!isRecording) return;
         isRecording = false;
-        if (hasDirectVideo) videoElement.pause();
+        try {
+          if (hasDirectVideo && videoElement && !videoElement.paused) {
+            videoElement.pause();
+          }
+        } catch (_) {}
 
         onProgress(100);
 
-        recorder.onstop = () => {
+        const safeCleanupAndResolve = () => {
           if (canvas.parentNode) {
-            canvas.parentNode.removeChild(canvas);
+            try { canvas.parentNode.removeChild(canvas); } catch (_) {}
           }
 
           const fileExt = selectedMime.includes("mp4") ? "mp4" : "webm";
@@ -459,7 +427,17 @@ export async function exportVideoClip({
           });
         };
 
-        recorder.stop();
+        if (recorder && recorder.state === "recording") {
+          recorder.onstop = safeCleanupAndResolve;
+          try {
+            recorder.stop();
+          } catch (e) {
+            console.warn("MediaRecorder stop warning:", e);
+            safeCleanupAndResolve();
+          }
+        } else {
+          safeCleanupAndResolve();
+        }
       }
 
       requestAnimationFrame(drawFrame);

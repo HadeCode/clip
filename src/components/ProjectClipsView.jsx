@@ -32,7 +32,7 @@ import {
   ThumbsDown,
   RotateCcw
 } from "lucide-react";
-import { formatTime, recurateClipsWithPrompt } from "../utils/aiClippingEngine";
+import { formatTime, recurateClipsWithPrompt, generateMoreViralClips } from "../utils/aiClippingEngine";
 import { exportVideoClip } from "../utils/videoRenderer";
 
 function YouTubeIcon({ size = 16, color = "#ff0000" }) {
@@ -74,6 +74,17 @@ export default function ProjectClipsView({
   const [safeZoneEnabledMap, setSafeZoneEnabledMap] = useState({});
   const [copiedClipId, setCopiedClipId] = useState(null);
 
+  // Generate More Clips with AI Replay Intelligence
+  const [showGenerateMoreModal, setShowGenerateMoreModal] = useState(false);
+  const [isGeneratingMore, setIsGeneratingMore] = useState(false);
+  const [generateProgress, setGenerateProgress] = useState(0);
+  const [generateStatusText, setGenerateStatusText] = useState("");
+  const [generateFocus, setGenerateFocus] = useState("replay");
+  const [generateCount, setGenerateCount] = useState(3);
+  const [generateDuration, setGenerateDuration] = useState("30-60");
+  const [generateCustomPrompt, setGenerateCustomPrompt] = useState("");
+  const [newlyAddedClipIds, setNewlyAddedClipIds] = useState({});
+
   // References for video elements per clip
   const videoRefs = useRef({});
   const cardRefs = useRef({});
@@ -107,15 +118,24 @@ export default function ProjectClipsView({
     let pollInterval = null;
     let attempts = 0;
 
+    const isDirectCandidate = (u) =>
+      typeof u === "string" &&
+      !u.includes("youtube.com/watch") &&
+      !u.includes("youtu.be/") &&
+      !u.includes("twitch.tv/") &&
+      !u.includes("kick.com/") &&
+      (u.startsWith("blob:") ||
+       u.startsWith("data:") ||
+       u.endsWith(".mp4") ||
+       u.endsWith(".webm") ||
+       u.includes("/downloads/") ||
+       u.includes(".m3u8") ||
+       u.includes("googlevideo.com") ||
+       u.includes("cloudfront.net"));
+
     const directCandidate =
-      safeProject.previewUrl ||
-      (typeof safeProject.sourceUrl === "string" &&
-        (safeProject.sourceUrl.startsWith("blob:") ||
-         safeProject.sourceUrl.endsWith(".mp4") ||
-         safeProject.sourceUrl.endsWith(".webm") ||
-         safeProject.sourceUrl.includes("/downloads/"))
-        ? safeProject.sourceUrl
-        : null);
+      (isDirectCandidate(safeProject.previewUrl) ? safeProject.previewUrl : null) ||
+      (isDirectCandidate(safeProject.sourceUrl) ? safeProject.sourceUrl : null);
 
     if (directCandidate) {
       setServerPreviewUrl(directCandidate);
@@ -135,8 +155,8 @@ export default function ProjectClipsView({
         if (res.ok) {
           const data = await res.json();
           if (!isMounted) return;
-          if (data.videoUrl) {
-            setServerPreviewUrl(data.videoUrl);
+          if (data.ready && data.videoUrl) {
+            setServerPreviewUrl(`${data.videoUrl}?v=${Date.now()}`);
           }
           if (Array.isArray(data.transcript) && data.transcript.length > 0) {
             setLiveTranscript(data.transcript);
@@ -329,37 +349,19 @@ export default function ProjectClipsView({
     setDownloadingClipId(clip.id);
     const cleanTitle = (clip.title || "vizard-viral-clip").replace(/[^a-zA-Z0-9_-]/g, "_");
 
-    // 1. If clip already has a rendered videoUrl blob or local video file, download directly!
-    if (clip.videoUrl && (clip.videoUrl.startsWith("blob:") || clip.videoUrl.startsWith("http"))) {
-      try {
-        const a = document.createElement("a");
-        a.href = clip.videoUrl;
-        a.download = `${cleanTitle}_9-16.mp4`;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        setDownloadingClipId(null);
-        return;
-      } catch (err) {
-        console.warn("Direct blob download failed, falling back to server cut", err);
-      }
-    }
-
-    // 2. Try real server-cut Full HD 9:16 vertical MP4 video with real audio via POST JSON
+    // Try real server-cut Full HD 9:16 vertical MP4 video with real audio & burned subtitles
     const ytUrl = project.youtubeId 
       ? `https://www.youtube.com/watch?v=${project.youtubeId}` 
       : (project.sourceUrl && project.sourceUrl.startsWith("http") ? project.sourceUrl : "");
 
     if (ytUrl) {
       try {
-        const vEl = videoRefs.current[clip.id];
-        const vDur = vEl && vEl.duration && !isNaN(vEl.duration) && vEl.duration > 0 ? vEl.duration : null;
-        let startSec = Math.floor(clip.startTime || 0);
-        let endSec = Math.ceil(clip.endTime || (startSec + (clip.duration || 15)));
-        if (vDur && startSec >= vDur) {
-          startSec = Math.floor((clip.startTime || 0) % Math.max(1, vDur - 10));
-          endSec = Math.ceil(Math.min(vDur, startSec + (clip.duration || 15)));
-        }
+        const startSec = Math.floor(clip.startTime || 0);
+        const endSec = Math.ceil(clip.endTime || (startSec + (clip.duration || 15)));
+
+        const validPreview = typeof serverPreviewUrl === "string" && serverPreviewUrl.includes("/downloads/")
+          ? serverPreviewUrl
+          : "";
 
         const res = await fetch("http://127.0.0.1:5001/api/download_clip", {
           method: "POST",
@@ -368,17 +370,16 @@ export default function ProjectClipsView({
           },
           body: JSON.stringify({
             url: ytUrl,
-            videoId: safeProject.videoId || clip.videoId || "",
-            previewUrl: safeProject.previewUrl || serverPreviewUrl || clip.videoUrl || "",
+            videoId: safeProject.videoId || clip.videoId || safeProject.youtubeId || "",
+            previewUrl: validPreview,
             startTime: startSec,
             endTime: endSec,
             aspectRatio: clip.aspectRatio || "9:16",
             title: cleanTitle,
-            headline: clip.headline || clip.title || "",
+            headline: "",
             subtitles: getAuthenticClipCues(clip)
           })
         });
-
 
         if (!res.ok) {
           const errData = await res.json().catch(() => ({}));
@@ -386,6 +387,10 @@ export default function ProjectClipsView({
         }
 
         const blob = await res.blob();
+        if (blob.size < 1000) {
+          throw new Error("Rendered video file was empty. Retrying...");
+        }
+
         const blobUrl = URL.createObjectURL(blob);
 
         // Store rendered MP4 onto clip so player can replay this exact cut video!
@@ -419,7 +424,10 @@ export default function ProjectClipsView({
         setDownloadingClipId(null);
         return;
       } catch (srvErr) {
-        console.warn("Direct server download exception, trying canvas fallback:", srvErr);
+        console.warn("Server download error:", srvErr);
+        alert("Download error: " + (srvErr.message || "Failed to render video on server. Please try again."));
+        setDownloadingClipId(null);
+        return;
       }
     }
 
@@ -433,7 +441,7 @@ export default function ProjectClipsView({
         aspectRatio: clip.aspectRatio || "9:16",
         subtitles: getAuthenticClipCues(clip),
         subtitleConfig: { preset: "hormozi", fontFamily: "Inter", activeColor: "#ffff00", textColor: "#ffffff", strokeColor: "#000000", strokeWidth: 4, uppercase: true },
-        headline: clip.headline || clip.title,
+        headline: "",
         onProgress: () => {}
       });
 
@@ -537,6 +545,93 @@ export default function ProjectClipsView({
       alert("CoPilot error: " + err.message);
     } finally {
       setIsRecurating(false);
+    }
+  };
+
+  // Generate More Viral Clips with AI Replay Intelligence (Guaranteed Non-Contiguous & High-Retention)
+  const handleGenerateMoreClips = async (focusOverride, countOverride) => {
+    const focusToUse = focusOverride || generateFocus;
+    const countToUse = countOverride || generateCount;
+
+    setIsGeneratingMore(true);
+    setGenerateProgress(15);
+    setGenerateStatusText("AI Replay Intelligence™ scanning full stream for unexplored peaks...");
+
+    try {
+      const currentTranscript = Array.isArray(liveTranscript) && liveTranscript.length > 0
+        ? liveTranscript
+        : (safeProject.transcript || []);
+
+      const transcriptMaxTime = currentTranscript.length > 0
+        ? Math.max(...currentTranscript.map((c) => (typeof c?.end === "number" ? c.end : (typeof c?.start === "number" ? c.start + 3 : 0))))
+        : 0;
+
+      const safeDur = Math.max(
+        safeProject.duration && safeProject.duration > 60 ? safeProject.duration : 0,
+        transcriptMaxTime,
+        clips.length > 0 ? Math.max(...clips.map((c) => c.endTime || 60)) + 60 : 180
+      );
+
+      const newClips = await generateMoreViralClips({
+        project: {
+          ...safeProject,
+          clips: clips,
+          duration: safeDur,
+          transcript: currentTranscript
+        },
+        count: countToUse,
+        focus: focusToUse,
+        durationRange: generateDuration,
+        customPrompt: generateCustomPrompt,
+        onProgress: (prog, text) => {
+          setGenerateProgress(prog);
+          setGenerateStatusText(text);
+        }
+      });
+
+      if (newClips && newClips.length > 0) {
+        const nextClips = [...clips, ...newClips];
+        setClips(nextClips);
+
+        // Highlight new clips with animated glow tag
+        const newMap = {};
+        newClips.forEach((c) => { newMap[c.id] = true; });
+        setNewlyAddedClipIds((prev) => ({ ...prev, ...newMap }));
+
+        // Focus and select the first new clip
+        setSelectedClipId(newClips[0].id);
+
+        // Save into project state
+        onUpdateProject?.({
+          ...safeProject,
+          clips: nextClips,
+          clipsCount: nextClips.length
+        });
+
+        setShowGenerateMoreModal(false);
+        setGenerateCustomPrompt("");
+
+        // Smooth scroll to the first newly created clip card
+        setTimeout(() => {
+          if (cardRefs.current[newClips[0].id]) {
+            cardRefs.current[newClips[0].id].scrollIntoView({ behavior: "smooth", block: "center" });
+          }
+        }, 350);
+
+        // Clear highlight tag after 10s
+        setTimeout(() => {
+          setNewlyAddedClipIds({});
+        }, 10000);
+      } else {
+        alert("No additional moments found within the timeline boundaries. Try expanding duration or adjusting focus!");
+      }
+    } catch (err) {
+      console.error("Generate more clips error:", err);
+      alert("Error generating more clips: " + (err.message || "Failed to generate"));
+    } finally {
+      setIsGeneratingMore(false);
+      setGenerateProgress(0);
+      setGenerateStatusText("");
     }
   };
 
@@ -760,6 +855,17 @@ export default function ProjectClipsView({
               <span>[V1] AI CLIP</span>
             </div>
             <span className="clips-count-label">{clips.length} clips</span>
+
+            <button
+              type="button"
+              className="btn-generate-more-clips-subbar"
+              onClick={() => setShowGenerateMoreModal(true)}
+              title="Discover more fun moments, replay peaks, and non-contiguous scenes across this video"
+            >
+              <Sparkles size={14} className="sparkle-pulse" />
+              <span>+ Generate More Clips</span>
+              <span className="subbar-pill-badge">AI REPLAY</span>
+            </button>
           </div>
 
           <div className="subbar-right">
@@ -933,12 +1039,34 @@ export default function ProjectClipsView({
                 safeProject.sourceUrl.match(/twitch\.tv\/([a-zA-Z0-9_]+)/i);
               const twitchChannel = twitchMatch ? twitchMatch[1] : null;
 
+              const isDirectVideoUrl = (u) =>
+                typeof u === "string" &&
+                !u.includes("youtube.com/watch") &&
+                !u.includes("youtu.be/") &&
+                !u.includes("twitch.tv/") &&
+                !u.includes("kick.com/") &&
+                (u.startsWith("blob:") ||
+                 u.startsWith("data:") ||
+                 u.endsWith(".mp4") ||
+                 u.endsWith(".webm") ||
+                 u.includes("/downloads/") ||
+                 u.includes("/api/clip_preview") ||
+                 u.includes("/api/download_clip") ||
+                 u.includes(".m3u8") ||
+                 u.includes("googlevideo.com") ||
+                 u.includes("cloudfront.net"));
+
+              // Generate dynamic clip preview URL if not set on older clips
+              const dynamicClipUrl = safeProject.sourceUrl
+                ? `http://127.0.0.1:5001/api/clip_preview?url=${encodeURIComponent(safeProject.sourceUrl)}&videoId=${safeProject.videoId || safeProject.youtubeId || ""}&startTime=${clip.startTime || 0}&endTime=${clip.endTime || (clip.startTime || 0) + (clip.duration || 30)}&aspectRatio=${clip.aspectRatio || "9:16"}`
+                : null;
+
               const playableVideo =
-                clip.videoUrl ||
-                serverPreviewUrl ||
-                safeProject.previewUrl ||
-                (isDirectSource ? safeProject.sourceUrl : null) ||
-                (safeProject.videoId ? `http://127.0.0.1:5001/downloads/${safeProject.videoId}_preview.mp4` : null);
+                (isDirectVideoUrl(clip.videoUrl) ? clip.videoUrl : null) ||
+                (isDirectVideoUrl(dynamicClipUrl) ? dynamicClipUrl : null) ||
+                (isDirectVideoUrl(serverPreviewUrl) ? serverPreviewUrl : null) ||
+                (isDirectVideoUrl(safeProject.previewUrl) ? safeProject.previewUrl : null) ||
+                (isDirectSource ? safeProject.sourceUrl : null);
 
               const currentClipTime = currentTimeMap[clip.id] ?? (clip.startTime || 0);
               const clipCues = getAuthenticClipCues(clip);
@@ -1015,6 +1143,18 @@ export default function ProjectClipsView({
                           }}
                         />
 
+                        {/* Floating Replay / Highlight Indicator Badge */}
+                        {clip.isMostReplayed ? (
+                          <div className="player-floating-replay-badge most-replayed" title="Audience retention peaked here—replayed multiple times">
+                            <Flame size={12} color="#ffffff" />
+                            <span>🔥 MOST REPLAYED</span>
+                          </div>
+                        ) : clip.replayBadge ? (
+                          <div className="player-floating-replay-badge" title={clip.replayRetentionRate || "Audience Retention Spike"}>
+                            <span>{clip.replayBadge.split(" ")[0] || "📈"} {clip.highlightType === "funny_moment" ? "HILARIOUS" : (clip.highlightType === "action_clutch" ? "CLIMAX" : "RETENTION PEAK")}</span>
+                          </div>
+                        ) : null}
+
                         {/* Video Element or YouTube / Twitch Stream Embed */}
                         {playableVideo ? (
                           <video
@@ -1027,93 +1167,67 @@ export default function ProjectClipsView({
                               const t = e.target.currentTime;
                               setCurrentTimeMap((prev) => ({ ...prev, [clip.id]: t }));
                               const vDur = e.target.duration && !isNaN(e.target.duration) && e.target.duration > 0 ? e.target.duration : null;
-                              let start = clip.startTime || 0;
-                              let end = clip.endTime || (start + (clip.duration || 15));
-                              if (vDur && start >= vDur) {
-                                start = (clip.startTime || 0) % Math.max(1, vDur - 10);
-                                end = Math.min(vDur, start + (clip.duration || 15));
-                              }
-                              if (t >= end || t < start) {
-                                e.target.currentTime = start;
+                              const isDedicatedClip = playableVideo.includes("/api/clip_preview") || (vDur && vDur <= (clip.duration || 30) + 15);
+
+                              if (isDedicatedClip) {
+                                // Dedicated clip video starts at 0 and loops its exact duration
+                                if (vDur && t >= vDur - 0.2) {
+                                  e.target.currentTime = 0;
+                                }
+                              } else {
+                                // Full source video timeline: seek within [clip.startTime, clip.endTime]
+                                const start = clip.startTime || 0;
+                                const end = clip.endTime || (start + (clip.duration || 15));
+                                if (t >= end || t < start) {
+                                  e.target.currentTime = start;
+                                }
                               }
                             }}
                             onLoadedMetadata={(e) => {
                               const vDur = e.target.duration && !isNaN(e.target.duration) && e.target.duration > 0 ? e.target.duration : null;
-                              let start = clip.startTime || 0;
-                              if (vDur && start >= vDur) {
-                                start = (clip.startTime || 0) % Math.max(1, vDur - 10);
-                              }
-                              if (start > 0) {
-                                e.target.currentTime = start;
+                              const isDedicatedClip = playableVideo.includes("/api/clip_preview") || (vDur && vDur <= (clip.duration || 30) + 15);
+                              if (!isDedicatedClip) {
+                                const start = clip.startTime || 0;
+                                if (start > 0 && (!vDur || start < vDur)) {
+                                  e.target.currentTime = start;
+                                }
                               }
                             }}
                             onEnded={(e) => {
                               const vDur = e.target.duration && !isNaN(e.target.duration) && e.target.duration > 0 ? e.target.duration : null;
-                              let start = clip.startTime || 0;
-                              if (vDur && start >= vDur) {
-                                start = (clip.startTime || 0) % Math.max(1, vDur - 10);
+                              const isDedicatedClip = playableVideo.includes("/api/clip_preview") || (vDur && vDur <= (clip.duration || 30) + 15);
+                              if (isDedicatedClip) {
+                                e.target.currentTime = 0;
+                              } else {
+                                e.target.currentTime = clip.startTime || 0;
                               }
-                              e.target.currentTime = start;
                               e.target.play().catch(() => {});
                             }}
+                            onError={() => {
+                              console.warn("Direct video stream loading... waiting for backend preview capture.");
+                            }}
                           />
-                        ) : safeProject.youtubeId ? (
-                          <div className="youtube-player-standin">
-                            {isPlaying ? (
-                              <iframe
-                                key={`yt-${clip.id}`}
-                                src={`https://www.youtube-nocookie.com/embed/${safeProject.youtubeId}?start=${Math.floor(clip.startTime || 0)}&autoplay=1&mute=0&controls=0&modestbranding=1&rel=0`}
-                                title={clip.title}
-                                className="vertical-inner-iframe"
-                                allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
-                              />
-                            ) : (
-                              <img
-                                src={
-                                  safeProject.thumbnail ||
-                                  `https://img.youtube.com/vi/${safeProject.youtubeId}/maxresdefault.jpg`
-                                }
-                                alt=""
-                                className="vertical-inner-video"
-                                style={{ objectFit: "cover" }}
-                              />
-                            )}
-                          </div>
-                        ) : twitchChannel ? (
-                          <div className="youtube-player-standin">
-                            {isPlaying ? (
-                              <iframe
-                                key={`twitch-${clip.id}`}
-                                src={`https://player.twitch.tv/?channel=${twitchChannel}&parent=localhost&parent=127.0.0.1&autoplay=true&muted=false`}
-                                title={clip.title}
-                                className="vertical-inner-iframe"
-                                allowFullScreen
-                              />
-                            ) : (
-                              <img
-                                src={safeProject.thumbnail || "https://images.unsplash.com/photo-1557804506-669a67965ba0?w=600&auto=format&fit=crop&q=80"}
-                                alt=""
-                                className="vertical-inner-video"
-                                style={{ objectFit: "cover" }}
-                              />
-                            )}
-                          </div>
                         ) : (
-                          <img
-                            src={safeProject.thumbnail || "https://images.unsplash.com/photo-1557804506-669a67965ba0?w=600&auto=format&fit=crop&q=80"}
-                            alt=""
-                            className="vertical-inner-video"
-                            style={{ objectFit: "cover" }}
-                          />
+                          <div className="youtube-player-standin">
+                            <img
+                              src={
+                                safeProject.thumbnail ||
+                                (safeProject.youtubeId ? `https://img.youtube.com/vi/${safeProject.youtubeId}/maxresdefault.jpg` : "") ||
+                                "https://images.unsplash.com/photo-1579546929518-9e396f3cc809?w=600&auto=format&fit=crop&q=80"
+                              }
+                              alt=""
+                              className="vertical-inner-video"
+                              style={{ objectFit: "cover" }}
+                            />
+                            <div className="preview-stream-sync-badge">
+                              <span className="live-dot-pulse" />
+                              <span>Syncing stream preview...</span>
+                            </div>
+                          </div>
                         )}
 
-                        {/* Subtitle & Hook Overlays on the Video Preview */}
+                        {/* Subtitle & Info Overlays on the Video Preview */}
                         <div className="video-card-overlays">
-                          {/* Top Hook Banner */}
-                          <div className="video-hook-badge">
-                            {clip.headline || clip.title}
-                          </div>
-
                           {/* Active Subtitle Phrase Preview */}
                           <div className="video-subtitle-phrase">
                             <span className="subtitle-karaoke-highlight">
@@ -1221,9 +1335,35 @@ export default function ProjectClipsView({
                     <div className="card-details-column">
                       {/* Title & Options Row */}
                       <div className="card-title-row">
-                        <h3 className="card-clip-heading">
-                          #{idx + 1} {clip.title}
-                        </h3>
+                        <div className="card-heading-cluster">
+                          <h3 className="card-clip-heading">
+                            #{idx + 1} {clip.title}
+                          </h3>
+
+                          {newlyAddedClipIds[clip.id] && (
+                            <span className="badge-new-highlight">✨ NEW MOMENT</span>
+                          )}
+
+                          {clip.isMostReplayed ? (
+                            <div className="replay-spike-pill-badge most-replayed" title="Audience retention peaked here—replayed multiple times by viewers">
+                              <Flame size={12} color="#ffffff" />
+                              <span>🔥 MOST REPLAYED (Top 1%)</span>
+                              <span className="retention-pill-small">{clip.replayRetentionRate || "99.4% Peak"}</span>
+                            </div>
+                          ) : clip.replayBadge ? (
+                            <div className="replay-spike-pill-badge" title="Audience retention spike">
+                              <span>{clip.replayBadge}</span>
+                              {clip.replayRetentionRate && (
+                                <span className="retention-pill-small">{clip.replayRetentionRate}</span>
+                              )}
+                            </div>
+                          ) : null}
+
+                          <span className="scene-separation-tag">
+                            Scene @ {formatTime(clip.startTime)} - {formatTime(clip.endTime)} ({clip.duration}s)
+                          </span>
+                        </div>
+
                         <div className="card-title-icons">
                           <button
                             className="icon-action-btn"
@@ -1422,6 +1562,94 @@ export default function ProjectClipsView({
                 </div>
               );
             })}
+
+            {/* Discover More Highlights & Fun Moments Card */}
+            <div className="discover-more-clips-card">
+              <div className="discover-card-glow-bg" />
+              <div className="discover-card-content">
+                <div className="discover-card-header">
+                  <div className="discover-brand-badge">
+                    <Flame size={16} color="#ff5722" />
+                    <span>AI REPLAY INTELLIGENCE™</span>
+                  </div>
+                  <span className="discover-tag-pill">NON-CONTIGUOUS DISCOVERY</span>
+                </div>
+
+                <h3 className="discover-card-title">
+                  Want more fun moments from this stream or video?
+                </h3>
+                <p className="discover-card-desc">
+                  Don't limit yourself to connected clips! Vizard AI scans unexplored timeline sections with strict anti-overlap spacing, targeting moments replayed multiple times, funniest chat reactions, or high-stakes drama.
+                </p>
+
+                {isGeneratingMore ? (
+                  <div className="discover-generating-progress-box">
+                    <div className="generating-progress-text">
+                      <Sparkles size={16} className="spin-icon" color="var(--primary)" />
+                      <span>{generateStatusText || "AI Replay Intelligence™ discovering new scenes..."}</span>
+                      <span className="generating-pct">{generateProgress}%</span>
+                    </div>
+                    <div className="discover-progress-bar-track">
+                      <div className="discover-progress-bar-fill" style={{ width: `${generateProgress}%` }} />
+                    </div>
+                  </div>
+                ) : (
+                  <div className="discover-buttons-grid">
+                    <button
+                      type="button"
+                      className="discover-btn btn-replay-peak"
+                      onClick={() => handleGenerateMoreClips("replay", 3)}
+                      title="Identify parts of the video replayed multiple times"
+                    >
+                      <Flame size={18} color="#ff5722" />
+                      <div className="btn-text-col">
+                        <div className="btn-main-label">🔥 Most Replayed Peaks</div>
+                        <div className="btn-sub-label">Top 1% Audience Rewind Spikes</div>
+                      </div>
+                    </button>
+
+                    <button
+                      type="button"
+                      className="discover-btn btn-funny-moments"
+                      onClick={() => handleGenerateMoreClips("funny", 3)}
+                      title="Detect jokes, laughing cues, and bloopers"
+                    >
+                      <span className="emoji-icon">😂</span>
+                      <div className="btn-text-col">
+                        <div className="btn-main-label">😂 Funniest Scenes & Reactions</div>
+                        <div className="btn-sub-label">Laughter Cues & Chat Comedy</div>
+                      </div>
+                    </button>
+
+                    <button
+                      type="button"
+                      className="discover-btn btn-action-climax"
+                      onClick={() => handleGenerateMoreClips("action", 3)}
+                      title="Detect adrenaline peaks, clutch plays, and hype"
+                    >
+                      <span className="emoji-icon">⚡</span>
+                      <div className="btn-text-col">
+                        <div className="btn-main-label">⚡ Climax & Clutch Plays</div>
+                        <div className="btn-sub-label">Peak Hype & Dramatic Action</div>
+                      </div>
+                    </button>
+
+                    <button
+                      type="button"
+                      className="discover-btn btn-custom-options"
+                      onClick={() => setShowGenerateMoreModal(true)}
+                      title="Open full options modal with custom count and prompt"
+                    >
+                      <SlidersHorizontal size={18} color="var(--primary)" />
+                      <div className="btn-text-col">
+                        <div className="btn-main-label">⚙️ Custom Discovery...</div>
+                        <div className="btn-sub-label">Select count, duration & vibes</div>
+                      </div>
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -1626,6 +1854,164 @@ export default function ProjectClipsView({
               </button>
               <button className="primary-pill-btn" onClick={() => setActiveScoreBreakdownClip(null)}>
                 Done
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 8. Generate More Clips Modal (AI Replay & Scene Discovery) */}
+      {showGenerateMoreModal && (
+        <div className="studio-modal-backdrop" onClick={() => !isGeneratingMore && setShowGenerateMoreModal(false)}>
+          <div className="generate-more-clips-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="generate-modal-header">
+              <div className="modal-header-brand">
+                <div className="brand-icon-circle">
+                  <Flame size={20} color="#ff5722" />
+                </div>
+                <div>
+                  <h3 className="modal-title">Generate More Clips</h3>
+                  <p className="modal-subtitle">AI Replay Intelligence™ • Non-Contiguous Scene Discovery</p>
+                </div>
+              </div>
+              {!isGeneratingMore && (
+                <button
+                  type="button"
+                  className="modal-close-icon-btn"
+                  onClick={() => setShowGenerateMoreModal(false)}
+                  title="Close"
+                >
+                  <X size={18} />
+                </button>
+              )}
+            </div>
+
+            <div className="generate-modal-body">
+              {/* Focus Vibes Selector */}
+              <div className="modal-section-group">
+                <label className="modal-section-label">Select AI Detection Focus</label>
+                <div className="focus-options-grid">
+                  {[
+                    { id: "replay", title: "🔥 Most Replayed (Top 1%)", desc: "Highlights scenes with the highest rewind frequency & audience retention" },
+                    { id: "funny", title: "😂 Funniest Moments & Banter", desc: "Detects spoken laughter, punchlines, bloopers & chat reactions" },
+                    { id: "action", title: "⚡ Climax & Clutch Plays", desc: "Adrenaline-fueled kinetic action, hype sequences & turning points" },
+                    { id: "hooks", title: "💡 Key Quotes & Takeaways", desc: "Actionable nuggets, knowledge hooks & educational insights" },
+                    { id: "balanced", title: "🎯 Balanced Diverse Mix", desc: "Wide distribution of best distinct moments across full video timeline" }
+                  ].map((opt) => (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      className={`focus-option-card ${generateFocus === opt.id ? "active-focus" : ""}`}
+                      onClick={() => setGenerateFocus(opt.id)}
+                      disabled={isGeneratingMore}
+                    >
+                      <div className="focus-option-title">{opt.title}</div>
+                      <div className="focus-option-desc">{opt.desc}</div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Clip Count & Duration Row */}
+              <div className="modal-grid-row">
+                <div className="modal-section-group">
+                  <label className="modal-section-label">Number of Additional Clips</label>
+                  <div className="pill-selector-row">
+                    {[
+                      { count: 2, label: "+2 Clips" },
+                      { count: 3, label: "+3 Clips (Recommended)" },
+                      { count: 5, label: "+5 Clips" }
+                    ].map((c) => (
+                      <button
+                        key={c.count}
+                        type="button"
+                        className={`pill-btn ${generateCount === c.count ? "active" : ""}`}
+                        onClick={() => setGenerateCount(c.count)}
+                        disabled={isGeneratingMore}
+                      >
+                        {c.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="modal-section-group">
+                  <label className="modal-section-label">Clip Target Duration</label>
+                  <div className="pill-selector-row">
+                    {[
+                      { val: "15-30", label: "15-30s (Shorts)" },
+                      { val: "30-60", label: "30-60s (Standard)" },
+                      { val: "60-90", label: "60-90s (Long)" }
+                    ].map((d) => (
+                      <button
+                        key={d.val}
+                        type="button"
+                        className={`pill-btn ${generateDuration === d.val ? "active" : ""}`}
+                        onClick={() => setGenerateDuration(d.val)}
+                        disabled={isGeneratingMore}
+                      >
+                        {d.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
+              {/* Anti-Overlap Guarantee Info Card */}
+              <div className="anti-overlap-guard-box">
+                <div className="guard-header">
+                  <ShieldCheck size={16} color="#10b981" />
+                  <strong>Strict Non-Contiguous Guarantee Active</strong>
+                </div>
+                <p className="guard-desc">
+                  Clips will be automatically spaced across the video with at least a 25-second separation gap from each other and all existing clips. Naive contiguous chopping is disabled.
+                </p>
+              </div>
+
+              {/* Custom Prompt Input */}
+              <div className="modal-section-group">
+                <label className="modal-section-label">Optional Topic or Punchline Search</label>
+                <input
+                  type="text"
+                  className="modal-prompt-input"
+                  placeholder='e.g. "Find where they debate the prize", "The biggest scream", "Gaming fail"'
+                  value={generateCustomPrompt}
+                  onChange={(e) => setGenerateCustomPrompt(e.target.value)}
+                  disabled={isGeneratingMore}
+                />
+              </div>
+
+              {/* Progress State */}
+              {isGeneratingMore && (
+                <div className="modal-generating-progress-box">
+                  <div className="progress-info-row">
+                    <span className="progress-status-msg">{generateStatusText || "Scanning timeline for replay spikes..."}</span>
+                    <span className="progress-pct-val">{generateProgress}%</span>
+                  </div>
+                  <div className="progress-bar-track">
+                    <div className="progress-bar-fill" style={{ width: `${generateProgress}%` }} />
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="generate-modal-footer">
+              <button
+                type="button"
+                className="modal-cancel-btn"
+                onClick={() => setShowGenerateMoreModal(false)}
+                disabled={isGeneratingMore}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="modal-submit-btn"
+                onClick={() => handleGenerateMoreClips()}
+                disabled={isGeneratingMore}
+              >
+                <Sparkles size={16} />
+                <span>{isGeneratingMore ? "Extracting Highlights..." : `Generate ${generateCount} New Clips`}</span>
               </button>
             </div>
           </div>

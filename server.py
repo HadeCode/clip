@@ -5,6 +5,17 @@ import json
 import shutil
 import subprocess
 import threading
+import uuid
+
+# Ensure UTF-8 output on Windows consoles to prevent emoji crash
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import yt_dlp
@@ -58,32 +69,38 @@ def wrap_text_lines(text, max_chars=22):
         lines.append(" ".join(current_line))
     return "\\N".join(lines)
 
-def build_ass_file(start_time, end_time, headline, subtitles_raw, ass_filepath):
-    """Generates an ASS subtitle file formatted for 9:16 vertical video with Hormozi style."""
+def build_ass_file(start_time, end_time, headline, subtitles_raw, ass_filepath, aspect_ratio="9:16"):
+    """Generates an ASS subtitle file formatted for 9:16, 1:1, or 16:9 video with Hormozi style."""
     duration = max(1.0, end_time - start_time)
+
+    if aspect_ratio == "1:1":
+        res_x, res_y = 1080, 1080
+        sub_margin_v = 140
+        sub_size = 54
+    elif aspect_ratio == "16:9":
+        res_x, res_y = 1920, 1080
+        sub_margin_v = 110
+        sub_size = 56
+    else:  # Default 9:16 vertical short
+        res_x, res_y = 1080, 1920
+        sub_margin_v = 360
+        sub_size = 60
+
     lines = [
         "[Script Info]",
         "ScriptType: v4.00+",
-        "PlayResX: 720",
-        "PlayResY: 1280",
+        f"PlayResX: {res_x}",
+        f"PlayResY: {res_y}",
         "",
         "[V4+ Styles]",
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-        "Style: Hook,Arial,34,&H00FFFFFF,&H000000FF,&H002B00FF,&H80000000,-1,0,0,0,100,100,0,0,1,3,0,8,40,40,90,1",
-        "Style: Subtitle,Arial,42,&H0000FFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,4,0,2,40,40,240,1",
+        f"Style: Subtitle,Arial,{sub_size},&H0000FFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,5,0,2,60,60,{sub_margin_v},1",
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
     ]
 
     has_dialogues = False
-
-    # 1. Hook Headline at top
-    if headline and headline.strip():
-        wrapped_hook = wrap_text_lines(headline.upper(), max_chars=26)
-        hook_text = "{\\bord4\\3c&H1010dd&}" + wrapped_hook
-        lines.append(f"Dialogue: 0,0:00:00.00,{format_ass_time(duration)},Hook,,0,0,0,,{hook_text}")
-        has_dialogues = True
 
     # 2. Subtitles in active window
     if subtitles_raw:
@@ -530,29 +547,37 @@ def get_ranked_creators(force_refresh=False):
 
 def select_best_streams(formats):
     """
-    Selects clean HTTPS direct streams:
-    - Prioritizes direct mp4/m4a candidate streams.
-    - Handles Twitch/Kick combined HLS/m3u8 manifests seamlessly.
-    - Selects the authentic original/default audio track.
+    Selects clean video and audio streams:
+    - Prioritizes direct mp4/m4a candidate streams for VODs.
+    - Gracefully handles m3u8_native streams for live broadcasts (IShowSpeed, Twitch, etc.).
+    - Strictly ensures best_v has a REAL video codec (never audio-only!).
     """
-    # 1. Video candidates (HTTPS only, no HLS)
+    if not formats:
+        return None, None
+
+    # 1. Video candidates (must have real video codec, never 'none')
     v_candidates = [
         f for f in formats 
-        if f.get("vcodec") != "none" and f.get("acodec") == "none" 
-        and f.get("protocol") == "https" and f.get("url")
+        if f.get("vcodec") and f.get("vcodec") != "none" and f.get("url")
     ]
-    best_v = None
-    v_720 = [f for f in v_candidates if (f.get("height") or 0) <= 720 and (f.get("height") or 0) > 0]
-    if v_720:
-        best_v = max(v_720, key=lambda f: (f.get("height") or 0, f.get("tbr") or 0))
-    elif v_candidates:
-        best_v = min(v_candidates, key=lambda f: f.get("height") or 9999)
 
-    # 2. Audio candidates (HTTPS only, strictly no HLS)
+    best_v = None
+    if v_candidates:
+        # Prefer HTTPS if available, otherwise use m3u8 live formats
+        v_https = [f for f in v_candidates if f.get("protocol") == "https" and f.get("acodec") == "none"]
+        pool_v = v_https if v_https else v_candidates
+        v_1080 = [f for f in pool_v if (f.get("height") or 0) <= 1080 and (f.get("height") or 0) > 0]
+        if v_1080:
+            best_v = max(v_1080, key=lambda f: (f.get("height") or 0, f.get("tbr") or 0))
+        else:
+            best_v = max(pool_v, key=lambda f: (f.get("height") or 0, f.get("tbr") or 0))
+
+    # 2. Audio candidates (must have audio, no video)
     a_candidates = [
         f for f in formats
-        if f.get("acodec") != "none" and f.get("vcodec") == "none"
-        and f.get("protocol") == "https" and f.get("url")
+        if (f.get("acodec") != "none" or f.get("resolution") == "audio only")
+        and f.get("vcodec") == "none"
+        and f.get("url")
     ]
 
     def audio_score(f):
@@ -560,13 +585,15 @@ def select_best_streams(formats):
         note = (f.get("format_note") or "").lower()
         lang = (f.get("language") or "").lower()
         ext = f.get("ext") or ""
+        proto = f.get("protocol") or ""
         abr = f.get("abr") or f.get("tbr") or 0
 
-        # Prioritize English / original / default audio track
-        if "original" in note or "default" in note:
+        if proto == "https":
             score += 1000
-        if lang in ("en", "eng", ""):
+        if "original" in note or "default" in note:
             score += 500
+        if lang in ("en", "eng", ""):
+            score += 300
         if ext == "m4a":
             score += 200
         score += min(200, int(abr))
@@ -574,27 +601,25 @@ def select_best_streams(formats):
 
     best_a = max(a_candidates, key=audio_score) if a_candidates else None
 
-    # Fallback to combined if separate streams not available (Twitch, Kick, etc.)
+    # 3. Fallback to combined video+audio formats (Twitch, Kick, single file) if either is missing
     if not best_v or not best_a:
         combined = [
             f for f in formats
-            if f.get("vcodec") != "none" and f.get("acodec") != "none" and f.get("url")
+            if f.get("vcodec") and f.get("vcodec") != "none"
+            and f.get("acodec") and f.get("acodec") != "none"
+            and f.get("url")
         ]
         if combined:
-            combined_720 = [f for f in combined if (f.get("height") or 0) <= 720 and (f.get("height") or 0) > 0]
-            chosen = max(combined_720, key=lambda f: (f.get("height") or 0, f.get("tbr") or 0)) if combined_720 else max(combined, key=lambda f: f.get("height") or 0)
+            combined_720 = [f for f in combined if (f.get("height") or 0) <= 1080 and (f.get("height") or 0) > 0]
+            chosen = max(combined_720, key=lambda f: (f.get("height") or 0, f.get("tbr") or 0)) if combined_720 else combined[0]
             if not best_v:
                 best_v = chosen
             if not best_a:
                 best_a = chosen
-        else:
-            for f in formats:
-                if f.get("url"):
-                    if not best_v:
-                        best_v = f
-                    if not best_a:
-                        best_a = f
-                    break
+
+    # Final sanity check: best_v MUST have real video
+    if best_v and (not best_v.get("vcodec") or best_v.get("vcodec") == "none"):
+        best_v = None
 
     return best_v, best_a
 
@@ -639,13 +664,13 @@ def extract_real_subtitles(info):
 def get_stream_action_start(duration, is_live):
     """
     Determines the ideal start timestamp for a stream or video:
-    - If currently live broadcast: 0 (pulls latest live chunks)
+    - If currently live broadcast: skip past the initial 60s stream connection buffer
     - If long VOD/stream (> 15 mins): skip past the intro / 'Stream Starting Soon' title card (typically 10-20 mins in)
     - If medium video (3-15 mins): skip the 15-30s intro hook
     - If short video (< 3 mins): start at 0
     """
     if is_live:
-        return 0.0
+        return 60.0 if duration >= 300 else 0.0
 
     if duration >= 7200:  # 2+ hours stream (e.g. Kai Cenat 7h stream)
         return min(1200.0, duration * 0.15)
@@ -689,8 +714,20 @@ def resolve_twitch_channel_vod(channel_name):
         print(f"Twitch VOD resolve fallback: {e}")
     return None
 
-def extract_direct_streams(url, return_action_start=False):
-    """Extracts direct CDN video and audio stream URLs using yt-dlp."""
+STREAM_CACHE = {}
+HEATMAP_CACHE = {}
+
+def extract_direct_streams(url, return_action_start=False, return_is_live=False):
+    """Extracts direct CDN video and audio stream URLs using yt-dlp with in-memory caching."""
+    now = time.time()
+    if url in STREAM_CACHE and (now - STREAM_CACHE[url]["ts"] < 3600):
+        cached_data = STREAM_CACHE[url]["data"]
+        if return_is_live:
+            return cached_data
+        if return_action_start:
+            return cached_data[:9]
+        return cached_data[:8]
+
     # For Twitch channel URLs, automatically resolve to their ongoing broadcast VOD to guarantee zero ads and action seeking
     if "twitch.tv" in url and "/videos/" not in url and "/clip/" not in url:
         channel_name = url.split("twitch.tv/")[-1].split("/")[0].split("?")[0]
@@ -712,12 +749,18 @@ def extract_direct_streams(url, return_action_start=False):
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
         video_id = str(info.get("id", "stream_video"))
+        heatmap = info.get("heatmap") or []
+        if heatmap:
+            HEATMAP_CACHE[video_id] = heatmap
         title = info.get("title") or "Live Stream Highlight"
         is_live = bool(info.get("is_live") or info.get("live_status") == "is_live" or ("m3u8" in str(info.get("url", "")) and "index-dvr" not in str(info.get("url", ""))))
         raw_dur = float(info.get("duration") or 0)
         action_start = get_stream_action_start(raw_dur, is_live)
-        # For stream clipping, report the captured action window duration (60s) if stream/VOD is long or live
-        duration = 60.0 if (is_live or raw_dur > 180) else (raw_dur or 60.0)
+        # For live streams, assign a 2400s (40 min) broadcast window if duration is unknown, ensuring non-contiguous clips
+        if is_live:
+            duration = raw_dur if (raw_dur and raw_dur > 300) else 2400.0
+        else:
+            duration = raw_dur if (raw_dur and raw_dur > 0) else 60.0
         thumbnail = info.get("thumbnail")
         uploader = info.get("uploader") or info.get("channel") or "Popular Streamer"
         formats = info.get("formats", [])
@@ -740,9 +783,14 @@ def extract_direct_streams(url, return_action_start=False):
                 except Exception:
                     pass
 
+        res_data = (video_id, title, duration, thumbnail, uploader, v_url, a_url, real_transcript, action_start, is_live)
+        STREAM_CACHE[url] = {"data": res_data, "ts": now}
+
+        if return_is_live:
+            return res_data
         if return_action_start:
-            return video_id, title, duration, thumbnail, uploader, v_url, a_url, real_transcript, action_start
-        return video_id, title, duration, thumbnail, uploader, v_url, a_url, real_transcript
+            return res_data[:9]
+        return res_data[:8]
 
 
 
@@ -828,124 +876,104 @@ def serve_download(filename):
     response.headers["Accept-Ranges"] = "bytes"
     return response
 
+PREVIEW_LOCK = threading.Lock()
+ACTIVE_PREVIEWS = set()
+
 def background_download_preview(url, video_id):
-    try:
-        real_video_id, _, duration, _, _, v_url, a_url, _, action_start = extract_direct_streams(url, return_action_start=True)
-        target_id = video_id or real_video_id
-        if not target_id:
+    target_id = video_id
+    if not target_id and url:
+        try:
+            target_id, _, _, _, _, _, _, _ = extract_direct_streams(url)
+        except Exception:
             return
 
-        preview_output = os.path.join(DOWNLOADS_DIR, f"{target_id}_preview.mp4")
-        if os.path.exists(preview_output) and os.path.getsize(preview_output) > 10000:
+    if not target_id:
+        return
+
+    with PREVIEW_LOCK:
+        if target_id in ACTIVE_PREVIEWS:
+            return
+        ACTIVE_PREVIEWS.add(target_id)
+
+    tmp_output = os.path.join(DOWNLOADS_DIR, f"{target_id}_preview_{uuid.uuid4().hex[:6]}.mp4")
+    preview_output = os.path.join(DOWNLOADS_DIR, f"{target_id}_preview.mp4")
+
+    try:
+        if os.path.exists(preview_output) and os.path.getsize(preview_output) > 50000:
             ensure_transcript_for_video(target_id, preview_output)
             return
 
-        print(f"Capturing stream action preview for {target_id} starting at {action_start}s to {action_start + 60}s...")
+        real_video_id, _, duration, _, _, v_url, a_url, _, action_start = extract_direct_streams(url, return_action_start=True)
+        if not real_video_id:
+            return
 
-        # 1. Resolve to broadcast VOD URL for Twitch streams to guarantee ad-free capture
-        target_url = url
-        if "twitch.tv" in target_url and "/videos/" not in target_url and "/clip/" not in target_url:
-            channel_name = target_url.split("twitch.tv/")[-1].split("/")[0].split("?")[0]
-            vod_url = resolve_twitch_channel_vod(channel_name)
-            if vod_url:
-                target_url = vod_url
-
-        temp_pattern = os.path.join(DOWNLOADS_DIR, f"temp_{target_id}.%(ext)s")
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "ffmpeg_location": FFMPEG_DIR,
-            "download_ranges": yt_dlp.utils.download_range_func(None, [(action_start, action_start + 60)]),
-            "outtmpl": temp_pattern,
-            "force_keyframes_at_cuts": True,
-            "extractor_args": {
-                "twitch": {
-                    "disable_ads": ["true"]
-                }
-            }
-        }
-
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([target_url])
-        except Exception as dl_err:
-            print(f"yt-dlp range download warning: {dl_err}")
-
-        # Locate downloaded section
-        downloaded_cand = None
-        for cand in [
-            os.path.join(DOWNLOADS_DIR, f"temp_{target_id}.mp4"),
-            os.path.join(DOWNLOADS_DIR, f"temp_{target_id}.mkv"),
-            os.path.join(DOWNLOADS_DIR, f"temp_{target_id}.webm")
-        ]:
-            if os.path.exists(cand) and os.path.getsize(cand) > 10000:
-                downloaded_cand = cand
-                break
-
-        if downloaded_cand:
-            # Re-encode to 720x1280 vertical MP4 with clean synchronized AAC audio
-            cmd = [
-                FFMPEG_EXE,
-                "-y",
-                "-i", downloaded_cand,
-                "-vf", "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280",
-                "-c:v", "libx264",
-                "-preset", "veryfast",
-                "-crf", "22",
-                "-c:a", "aac",
-                "-b:a", "192k",
-                "-ar", "48000",
-                "-af", "aresample=async=1",
-                "-avoid_negative_ts", "make_zero",
-                preview_output
-            ]
-            subprocess.run(cmd, check=True)
-            try:
-                os.remove(downloaded_cand)
-            except Exception:
-                pass
-        elif v_url:
-            # Fallback to direct stream URL
+        if v_url:
+            print(f"Capturing stream preview for {target_id} starting at {action_start}s...")
             cmd = [
                 FFMPEG_EXE,
                 "-y",
                 "-fflags", "+genpts+discardcorrupt",
-                "-thread_queue_size", "2048",
                 "-ss", str(action_start),
-                "-i", v_url,
+                "-i", v_url
+            ]
+            if a_url and a_url != v_url:
+                cmd.extend([
+                    "-ss", str(action_start),
+                    "-i", a_url
+                ])
+            cmd.extend([
                 "-t", "60",
-                "-vf", "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280",
+                "-vf", "setsar=1,scale=1080:1920:force_original_aspect_ratio=increase:flags=lanczos,crop=1080:1920,setsar=1,setdar=9/16,setpts=PTS-STARTPTS",
+                "-af", "aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS",
+                "-fps_mode", "cfr",
+                "-r", "30",
                 "-c:v", "libx264",
                 "-preset", "ultrafast",
-                "-crf", "24",
+                "-crf", "23",
+                "-aspect", "9:16",
                 "-c:a", "aac",
-                "-b:a", "192k",
+                "-b:a", "320k",
                 "-ar", "48000",
-                "-af", "aresample=async=1",
-                preview_output
-            ]
-            subprocess.run(cmd, check=True)
-
-        if os.path.exists(preview_output) and os.path.getsize(preview_output) > 10000:
-            print(f"Generated preview video: {preview_output}")
-            ensure_transcript_for_video(target_id, preview_output)
-
-            if real_video_id and target_id != real_video_id:
-                alias_output = os.path.join(DOWNLOADS_DIR, f"{real_video_id}_preview.mp4")
-                if not os.path.exists(alias_output) and os.path.exists(preview_output):
+                "-shortest",
+                tmp_output
+            ])
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            if res.returncode == 0 and os.path.exists(tmp_output) and os.path.getsize(tmp_output) > 20000:
+                if os.path.exists(preview_output):
                     try:
-                        shutil.copy(preview_output, alias_output)
+                        os.remove(preview_output)
                     except Exception:
                         pass
-                alias_trans = os.path.join(DOWNLOADS_DIR, f"{real_video_id}_transcript.json")
-                orig_trans = os.path.join(DOWNLOADS_DIR, f"{target_id}_transcript.json")
-                if not os.path.exists(alias_trans) and os.path.exists(orig_trans):
-                    try:
-                        shutil.copy(orig_trans, alias_trans)
-                    except Exception:
-                        pass
+                os.replace(tmp_output, preview_output)
+                print(f"Generated preview video: {preview_output}")
+                ensure_transcript_for_video(target_id, preview_output)
+
+                if real_video_id and target_id != real_video_id:
+                    alias_output = os.path.join(DOWNLOADS_DIR, f"{real_video_id}_preview.mp4")
+                    if not os.path.exists(alias_output) and os.path.exists(preview_output):
+                        try:
+                            shutil.copy(preview_output, alias_output)
+                        except Exception:
+                            pass
+                    alias_trans = os.path.join(DOWNLOADS_DIR, f"{real_video_id}_transcript.json")
+                    orig_trans = os.path.join(DOWNLOADS_DIR, f"{target_id}_transcript.json")
+                    if not os.path.exists(alias_trans) and os.path.exists(orig_trans):
+                        try:
+                            shutil.copy(orig_trans, alias_trans)
+                        except Exception:
+                            pass
+            elif res.returncode != 0:
+                print(f"FFmpeg preview capture error: {res.stderr[-300:]}")
     except Exception as e:
-        print(f"Background preview error: {e}")
+        print(f"Background preview error for {target_id}: {e}")
+    finally:
+        if os.path.exists(tmp_output):
+            try:
+                os.remove(tmp_output)
+            except Exception:
+                pass
+        with PREVIEW_LOCK:
+            ACTIVE_PREVIEWS.discard(target_id)
 
 
 @app.route("/api/youtube", methods=["GET", "POST"])
@@ -962,7 +990,7 @@ def process_youtube():
     print(f"Processing YouTube URL: {url}")
 
     try:
-        video_id, title, duration, thumbnail, uploader, v_url, a_url, transcript = extract_direct_streams(url)
+        video_id, title, duration, thumbnail, uploader, v_url, a_url, transcript, action_start, is_live = extract_direct_streams(url, return_is_live=True)
 
         preview_filename = f"{video_id}_preview.mp4"
         preview_filepath = os.path.join(DOWNLOADS_DIR, preview_filename)
@@ -980,12 +1008,14 @@ def process_youtube():
             "videoId": video_id,
             "title": title,
             "duration": duration,
+            "isLive": is_live,
             "thumbnail": thumbnail,
             "uploader": uploader,
             "streamUrl": preview_url if is_ready else None,
             "previewUrl": preview_url,
             "isReady": is_ready,
-            "transcript": transcript or []
+            "transcript": transcript or [],
+            "heatmap": HEATMAP_CACHE.get(video_id, [])
         })
 
     except Exception as e:
@@ -1035,12 +1065,178 @@ def get_clip_media():
             "success": True,
             "videoId": video_id,
             "ready": is_ready,
-            "videoUrl": f"http://127.0.0.1:5001/downloads/{preview_filename}",
+            "videoUrl": f"http://127.0.0.1:5001/downloads/{preview_filename}" if is_ready else None,
             "transcript": transcript or []
         })
 
 
     return jsonify({"success": False, "error": "Could not identify video"}), 400
+
+CLIP_RENDER_LOCK = threading.Lock()
+ACTIVE_CLIP_EVENTS = {}
+
+@app.route("/api/clip_preview", methods=["GET", "OPTIONS"])
+def get_clip_preview():
+    if request.method == "OPTIONS":
+        res = jsonify({"status": "ok"})
+        res.headers["Access-Control-Allow-Origin"] = "*"
+        res.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+        res.headers["Access-Control-Allow-Headers"] = "*"
+        return res
+
+    url = request.args.get("url", "").strip()
+    video_id = request.args.get("videoId", "").strip()
+    start_time = float(request.args.get("startTime", 0))
+    end_time = float(request.args.get("endTime", start_time + 30))
+    aspect_ratio = request.args.get("aspectRatio", "9:16")
+
+    # If video_id not given but url is, extract it
+    if not video_id and url:
+        try:
+            video_id, _, _, _, _, _, _, _ = extract_direct_streams(url)
+        except Exception:
+            pass
+
+    target_id = video_id or "clip"
+    clip_filename = f"{target_id}_{int(start_time)}_{int(end_time)}_preview.mp4"
+    clip_filepath = os.path.join(DOWNLOADS_DIR, clip_filename)
+
+    # Return immediately if already cut and verified
+    if os.path.exists(clip_filepath) and os.path.getsize(clip_filepath) > 20000:
+        response = send_from_directory(DOWNLOADS_DIR, clip_filename, conditional=True, as_attachment=False, mimetype="video/mp4")
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Accept-Ranges"] = "bytes"
+        return response
+
+    # Concurrency control: wait if another thread is currently rendering this exact clip
+    render_event = None
+    is_initiator = False
+    with CLIP_RENDER_LOCK:
+        if clip_filename in ACTIVE_CLIP_EVENTS:
+            render_event = ACTIVE_CLIP_EVENTS[clip_filename]
+        else:
+            render_event = threading.Event()
+            ACTIVE_CLIP_EVENTS[clip_filename] = render_event
+            is_initiator = True
+
+    if not is_initiator:
+        # Wait for the initiator thread to complete
+        render_event.wait(timeout=25)
+        if os.path.exists(clip_filepath) and os.path.getsize(clip_filepath) > 20000:
+            response = send_from_directory(DOWNLOADS_DIR, clip_filename, conditional=True, as_attachment=False, mimetype="video/mp4")
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            response.headers["Accept-Ranges"] = "bytes"
+            return response
+
+    try:
+        # Check if a master preview exists
+        master_preview = os.path.join(DOWNLOADS_DIR, f"{target_id}_preview.mp4")
+
+        # If stream URL available, extract authentic streams
+        v_url = None
+        a_url = None
+        if url:
+            try:
+                _, _, _, _, _, ext_v, ext_a, _ = extract_direct_streams(url)
+                v_url = ext_v
+                a_url = ext_a
+            except Exception as e:
+                print(f"Clip preview extraction error: {e}")
+
+        # Check if master preview can cover this time range (e.g. if start_time is within first 60s)
+        if not v_url and os.path.exists(master_preview) and os.path.getsize(master_preview) > 20000:
+            if end_time <= 60.0:
+                v_url = master_preview
+                a_url = master_preview
+
+        if not v_url:
+            if end_time <= 60.0 and os.path.exists(master_preview) and os.path.getsize(master_preview) > 10000:
+                response = send_from_directory(DOWNLOADS_DIR, f"{target_id}_preview.mp4", conditional=True, as_attachment=False, mimetype="video/mp4")
+                response.headers["Access-Control-Allow-Origin"] = "*"
+                response.headers["Accept-Ranges"] = "bytes"
+                return response
+            return jsonify({"error": "Stream media not ready"}), 404
+
+        tmp_token = uuid.uuid4().hex[:8]
+        tmp_output = os.path.join(DOWNLOADS_DIR, f"{target_id}_{int(start_time)}_{int(end_time)}_{tmp_token}.mp4")
+        dur = max(5.0, min(60.0, end_time - start_time))
+        fast_seek = max(0.0, start_time - 3.0)
+        accurate_offset = start_time - fast_seek
+
+        # Fast 9:16 vertical render (540x960 for snappy preview playback in UI)
+        cmd = [
+            FFMPEG_EXE,
+            "-y",
+            "-fflags", "+genpts+discardcorrupt",
+            "-thread_queue_size", "2048",
+            "-probesize", "16M",
+            "-analyzeduration", "10M",
+            "-ss", str(fast_seek),
+            "-i", v_url
+        ]
+        if a_url and a_url != v_url:
+            cmd.extend([
+                "-thread_queue_size", "2048",
+                "-probesize", "16M",
+                "-analyzeduration", "10M",
+                "-ss", str(fast_seek),
+                "-i", a_url
+            ])
+        cmd.extend([
+            "-ss", str(accurate_offset),
+            "-t", str(dur),
+            "-vf", "setsar=1,scale=540:960:force_original_aspect_ratio=increase:flags=bicubic,crop=540:960,setsar=1,setdar=9/16,setpts=PTS-STARTPTS",
+            "-af", "aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS",
+            "-fps_mode", "cfr",
+            "-r", "30",
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-crf", "24",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-movflags", "+faststart",
+            "-shortest",
+            tmp_output
+        ])
+
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if res.returncode == 0 and os.path.exists(tmp_output) and os.path.getsize(tmp_output) > 10000:
+                if os.path.exists(clip_filepath):
+                    try:
+                        os.remove(clip_filepath)
+                    except Exception:
+                        pass
+                os.replace(tmp_output, clip_filepath)
+                response = send_from_directory(DOWNLOADS_DIR, clip_filename, conditional=True, as_attachment=False, mimetype="video/mp4")
+                response.headers["Access-Control-Allow-Origin"] = "*"
+                response.headers["Accept-Ranges"] = "bytes"
+                return response
+            elif res.returncode != 0:
+                print(f"FFmpeg preview cut failed (code {res.returncode}): {res.stderr[-200:]}")
+        except Exception as e:
+            print(f"Error cutting clip preview: {e}")
+        finally:
+            if os.path.exists(tmp_output):
+                try:
+                    os.remove(tmp_output)
+                except Exception:
+                    pass
+
+        # Only fall back to master preview IF the requested clip is actually inside the master preview window (< 60s)
+        if end_time <= 60.0 and os.path.exists(master_preview) and os.path.getsize(master_preview) > 10000:
+            response = send_from_directory(DOWNLOADS_DIR, f"{target_id}_preview.mp4", conditional=True, as_attachment=False, mimetype="video/mp4")
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            response.headers["Accept-Ranges"] = "bytes"
+            return response
+
+        return jsonify({"error": "Failed to cut clip preview at requested timeline"}), 500
+    finally:
+        with CLIP_RENDER_LOCK:
+            if clip_filename in ACTIVE_CLIP_EVENTS:
+                ACTIVE_CLIP_EVENTS[clip_filename].set()
+                del ACTIVE_CLIP_EVENTS[clip_filename]
+
 
 @app.route("/api/download_clip", methods=["GET", "POST", "HEAD"])
 def download_clip():
@@ -1082,211 +1278,180 @@ def download_clip():
     duration = max(1.0, end_time - start_time)
     clean_title = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in title).strip("_") or "clip"
 
-    # Identify video_id if not explicitly provided
-    if not video_id and url:
-        try:
-            video_id, _, _, _, _, _, _, _ = extract_direct_streams(url)
-        except Exception:
-            pass
-
-    # 1. Prioritize cutting directly from the captured project recording/preview file
-    # This guarantees 100% audio-video sync and speech matching the previewed scene!
+    # Identify video_id and extract authentic online streams if URL provided
+    v_url = None
+    a_url = None
     local_source = None
-    if preview_url and "/downloads/" in preview_url:
-        cand = os.path.join(DOWNLOADS_DIR, preview_url.split("/downloads/")[-1])
-        if os.path.exists(cand) and os.path.getsize(cand) > 10000:
-            local_source = cand
 
-    if not local_source and video_id:
-        cand = os.path.join(DOWNLOADS_DIR, f"{video_id}_preview.mp4")
-        if os.path.exists(cand) and os.path.getsize(cand) > 10000:
-            local_source = cand
-
-    if not local_source and url and os.path.exists(url):
+    if url and os.path.exists(url) and not url.startswith("http"):
         local_source = url
+        v_url = url
+        a_url = url
+    else:
+        # Online video source (YouTube, Twitch, Kick, etc.)
+        effective_url = url
+        if not effective_url and video_id:
+            effective_url = f"https://www.youtube.com/watch?v={video_id}"
 
-    # If local master not yet present, generate it from the stream action
-    if not local_source and (url or video_id):
-        preview_filename = f"{video_id}_preview.mp4"
-        preview_filepath = os.path.join(DOWNLOADS_DIR, preview_filename)
-        if not os.path.exists(preview_filepath) or os.path.getsize(preview_filepath) <= 10000:
-            print(f"Generating master preview before cutting for {video_id or url}...")
-            background_download_preview(url, video_id)
-        if os.path.exists(preview_filepath) and os.path.getsize(preview_filepath) > 10000:
-            local_source = preview_filepath
+        if effective_url:
+            try:
+                extracted_id, _, _, _, _, ext_v, ext_a, ext_trans = extract_direct_streams(effective_url)
+                if not video_id:
+                    video_id = extracted_id
+                v_url = ext_v
+                a_url = ext_a
+                if not subtitles and ext_trans:
+                    subtitles = ext_trans
+            except Exception as e:
+                print(f"Direct stream extraction error: {e}")
 
+    # Fallback to local files if stream extraction failed
+    if not v_url:
+        if preview_url and "/downloads/" in preview_url:
+            cand = os.path.join(DOWNLOADS_DIR, preview_url.split("/downloads/")[-1])
+            if os.path.exists(cand) and os.path.getsize(cand) > 10000:
+                local_source = cand
+                v_url = cand
+                a_url = cand
 
-    # Cache key with v3 audio-sync tag
-    has_sub_tag = "sub" if (headline or subtitles) else "raw"
-    output_filename = f"{video_id or 'clip'}_{int(start_time)}_{int(end_time)}_{aspect_ratio.replace(':', '')}_{has_sub_tag}_sync_v3.mp4"
+        if not v_url and video_id:
+            cand = os.path.join(DOWNLOADS_DIR, f"{video_id}_preview.mp4")
+            if os.path.exists(cand) and os.path.getsize(cand) > 10000:
+                local_source = cand
+                v_url = cand
+                a_url = cand
+
+    if not v_url:
+        return jsonify({"error": "Could not access video stream for cutting."}), 500
+
+    # Cache key with v5 synchronized engine tag (Shorts aspect ratio + clean dynamic subtitles)
+    has_sub_tag = "sub" if subtitles else "raw"
+    aspect_tag = aspect_ratio.replace(":", "")
+    output_filename = f"{video_id or 'clip'}_{int(start_time)}_{int(end_time)}_{aspect_tag}_{has_sub_tag}_sync_v5.mp4"
     output_filepath = os.path.join(DOWNLOADS_DIR, output_filename)
 
-    # Clean up any previously created empty/corrupt files (<10KB)
-    if os.path.exists(output_filepath) and os.path.getsize(output_filepath) <= 10000:
+    # Return if already cut with synchronized v5 engine
+    if os.path.exists(output_filepath) and os.path.getsize(output_filepath) > 50000:
+        return send_from_directory(
+            DOWNLOADS_DIR,
+            output_filename,
+            as_attachment=True,
+            download_name=f"{clean_title}_{aspect_ratio.replace(':', '-')}.mp4",
+            mimetype="video/mp4"
+        )
+
+    # Clean up empty or broken previous attempts
+    if os.path.exists(output_filepath) and os.path.getsize(output_filepath) <= 50000:
         try:
             os.remove(output_filepath)
         except Exception:
             pass
 
-    # Return if already cut with synchronized v3 engine
-    if os.path.exists(output_filepath) and os.path.getsize(output_filepath) > 10000:
-        return send_from_directory(
-            DOWNLOADS_DIR,
-            output_filename,
-            as_attachment=True,
-            download_name=f"{clean_title}_9-16.mp4",
-            mimetype="video/mp4"
-        )
-
-    # Base video scaling/cropping filter (without artificial PTS shifting that breaks A/V sync)
+    # High-Definition Layout filters ensuring square pixel SAR (1:1) and proper DAR
     if aspect_ratio == "1:1":
-        base_vf = "scale=1080:1080:force_original_aspect_ratio=increase,crop=1080:1080"
+        base_vf = "[0:v]setsar=1[v0];[v0]split[bg][fg];[bg]scale=1080:1080:force_original_aspect_ratio=increase,crop=1080:1080,boxblur=25:5,eq=brightness=-0.2[bg_blur];[fg]scale=1080:-2:flags=lanczos[fg_scaled];[bg_blur][fg_scaled]overlay=(W-w)/2:(H-h)/2,setsar=1,setdar=1/1"
+        out_aspect = "1:1"
     elif aspect_ratio == "16:9":
-        base_vf = "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2"
+        base_vf = "[0:v]setsar=1,scale=1920:1080:force_original_aspect_ratio=decrease:flags=lanczos,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,setdar=16/9"
+        out_aspect = "16:9"
     else:
-        # Default 9:16 vertical short
-        base_vf = "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280"
+        # Default 9:16 vertical short (1080x1920 Full HD YouTube Shorts format with ambient blurred wings)
+        base_vf = "[0:v]setsar=1[v0];[v0]split[bg][fg];[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=25:5,eq=brightness=-0.25[bg_blur];[fg]scale=1080:-2:flags=lanczos[fg_scaled];[bg_blur][fg_scaled]overlay=(W-w)/2:(H-h)/2,setsar=1,setdar=9/16"
+        out_aspect = "9:16"
 
-    # Probe local duration if local master exists
-    local_duration = 0.0
-    if local_source:
-        try:
-            probe_cmd = [FFMPEG_EXE, "-i", local_source]
-            p = subprocess.run(probe_cmd, capture_output=True, text=True)
-            for line in p.stderr.splitlines():
-                if "Duration:" in line:
-                    dur_str = line.split("Duration:")[1].split(",")[0].strip()
-                    parts = dur_str.split(":")
-                    local_duration = float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
-                    break
-        except Exception:
-            local_duration = 45.0
+    base_af = "aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS"
 
-    actual_start = start_time
-    actual_duration = duration
-    if local_source and local_duration > 5.0:
-        if actual_start >= local_duration:
-            actual_start = float(int(start_time) % int(max(1.0, local_duration - 10.0)))
-        if actual_start + actual_duration > local_duration:
-            actual_duration = max(5.0, local_duration - actual_start)
+    # Subtitle burning filter with ASS styling matching aspect ratio (no red hook caption)
+    ass_path = os.path.join(DOWNLOADS_DIR, f"{video_id or 'clip'}_{int(start_time)}_{int(end_time)}.ass")
+    sub_ready = build_ass_file(start_time, end_time, "", subtitles, ass_path, aspect_ratio=aspect_ratio)
 
-    # Load authentic transcript if subtitles empty or contain placeholder template text
-    if (is_placeholder_subtitles(subtitles) or not subtitles) and (video_id or local_source):
-        trans_file = os.path.join(DOWNLOADS_DIR, f"{video_id}_transcript.json") if video_id else None
-        loaded = None
-        if trans_file and os.path.exists(trans_file):
-            try:
-                with open(trans_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    if is_valid_transcript(data):
-                        loaded = data
-            except Exception:
-                pass
-
-        if not loaded and local_source and os.path.exists(local_source):
-            print(f"Ensuring authentic Whisper transcript for {local_source}...")
-            loaded = ensure_transcript_for_video(video_id or "clip", local_source)
-
-        if loaded:
-            subtitles = loaded
-
-    # Subtitle burning filter - use actual_start and actual_duration for perfect frame/audio sync
-    ass_path = os.path.join(DOWNLOADS_DIR, f"{video_id or 'clip'}_{int(actual_start)}_{int(actual_start + actual_duration)}.ass")
-    sub_ready = build_ass_file(actual_start, actual_start + actual_duration, headline, subtitles, ass_path)
-
-    vf_filter = base_vf
+    vf_clean = f"{base_vf}[v_out]"
     if sub_ready and os.path.exists(ass_path):
-        safe_ass = ass_path.replace("\\", "/").replace(":", "\\:")
-        vf_filter = f"{base_vf},subtitles={safe_ass}"
+        rel_ass = os.path.relpath(ass_path, os.getcwd()).replace("\\", "/")
+        vf_filter = f"{base_vf},subtitles={rel_ass}[v_out]"
+    else:
+        vf_filter = vf_clean
 
+    # 2-stage sample-accurate seeking calculation to eliminate all A/V offset drift
+    fast_seek = max(0.0, start_time - 6.0)
+    accurate_offset = start_time - fast_seek
+
+    temp_cut_filepath = f"{output_filepath}.tmp.{uuid.uuid4().hex[:6]}.mp4"
 
     def run_cut_process(current_vf):
-        if local_source:
-            print(f"Cutting clip directly from synchronized local master: {local_source} ({actual_start}s to {actual_start + actual_duration}s)")
+        if a_url and a_url != v_url:
+            # Separate video and audio streams (YouTube DASH, etc.)
             cmd = [
                 FFMPEG_EXE,
                 "-y",
-                "-ss", str(actual_start),
-                "-i", local_source,
-                "-t", str(actual_duration),
-                "-vf", current_vf,
+                "-fflags", "+genpts+discardcorrupt",
+                "-thread_queue_size", "4096",
+                "-ss", str(fast_seek),
+                "-i", v_url,
+                "-thread_queue_size", "4096",
+                "-ss", str(fast_seek),
+                "-i", a_url,
+                "-ss", str(accurate_offset),
+                "-t", str(duration),
+                "-filter_complex", current_vf,
+                "-map", "[v_out]",
+                "-map", "1:a:0",
+                "-af", base_af,
+                "-fps_mode", "cfr",
+                "-r", "30",
                 "-c:v", "libx264",
                 "-preset", "veryfast",
-                "-crf", "22",
+                "-crf", "18",
+                "-aspect", out_aspect,
                 "-c:a", "aac",
-                "-b:a", "192k",
+                "-b:a", "320k",
                 "-ar", "48000",
-                "-af", "aresample=async=1",
-                "-avoid_negative_ts", "make_zero",
-                output_filepath
+                "-shortest",
+                temp_cut_filepath
             ]
         else:
-            print(f"Extracting direct stream for cutting: {url} ({start_time}s to {end_time}s)")
-            _, _, _, _, _, v_url, a_url, _ = extract_direct_streams(url)
-            if not v_url:
-                raise Exception("No playable video streams found")
-
-            if a_url and a_url != v_url:
-                # Separate video and audio streams with sample-accurate sync
-                cmd = [
-                    FFMPEG_EXE,
-                    "-y",
-                    "-fflags", "+genpts+discardcorrupt",
-                    "-thread_queue_size", "2048",
-                    "-ss", str(start_time),
-                    "-i", v_url,
-                    "-thread_queue_size", "2048",
-                    "-ss", str(start_time),
-                    "-i", a_url,
-                    "-t", str(duration),
-                    "-map", "0:v:0",
-                    "-map", "1:a:0",
-                    "-vf", current_vf,
-                    "-c:v", "libx264",
-                    "-preset", "veryfast",
-                    "-crf", "22",
-                    "-c:a", "aac",
-                    "-b:a", "192k",
-                    "-ar", "48000",
-                    "-af", "aresample=async=1",
-                    "-shortest",
-                    "-avoid_negative_ts", "make_zero",
-                    output_filepath
-                ]
-            else:
-                # Combined stream
-                cmd = [
-                    FFMPEG_EXE,
-                    "-y",
-                    "-fflags", "+genpts+discardcorrupt",
-                    "-thread_queue_size", "2048",
-                    "-ss", str(start_time),
-                    "-i", v_url,
-                    "-t", str(duration),
-                    "-map", "0:v:0",
-                    "-map", "0:a:0",
-                    "-vf", current_vf,
-                    "-c:v", "libx264",
-                    "-preset", "veryfast",
-                    "-crf", "22",
-                    "-c:a", "aac",
-                    "-b:a", "192k",
-                    "-ar", "48000",
-                    "-af", "aresample=async=1",
-                    "-shortest",
-                    "-avoid_negative_ts", "make_zero",
-                    output_filepath
-                ]
+            # Single combined stream or local file
+            cmd = [
+                FFMPEG_EXE,
+                "-y",
+                "-fflags", "+genpts+discardcorrupt",
+                "-thread_queue_size", "4096",
+                "-ss", str(fast_seek),
+                "-i", v_url,
+                "-ss", str(accurate_offset),
+                "-t", str(duration),
+                "-filter_complex", current_vf,
+                "-map", "[v_out]",
+                "-map", "0:a:0?",
+                "-af", base_af,
+                "-fps_mode", "cfr",
+                "-r", "30",
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-crf", "18",
+                "-aspect", out_aspect,
+                "-c:a", "aac",
+                "-b:a", "320k",
+                "-ar", "48000",
+                "-shortest",
+                temp_cut_filepath
+            ]
         return subprocess.run(cmd, capture_output=True, text=True)
 
     try:
+        print(f"Cutting sample-accurate 1080p clip: {video_id} ({start_time}s to {end_time}s, {aspect_ratio})")
         res = run_cut_process(vf_filter)
-        if res.returncode != 0 and vf_filter != base_vf:
+        if res.returncode != 0 and vf_filter != vf_clean:
             print(f"Subtitle burn failed ({res.stderr[:200]}), falling back to clean video filter...")
-            res = run_cut_process(base_vf)
+            res = run_cut_process(vf_clean)
 
         if res.returncode != 0:
             print(f"FFmpeg error: {res.stderr[-500:]}")
+            if os.path.exists(temp_cut_filepath):
+                try:
+                    os.remove(temp_cut_filepath)
+                except Exception:
+                    pass
             return jsonify({"error": f"FFmpeg processing failed: {res.stderr[-300:]}"}), 500
 
         # Clean up temporary ASS file
@@ -1296,12 +1461,13 @@ def download_clip():
             except Exception:
                 pass
 
-        if os.path.exists(output_filepath) and os.path.getsize(output_filepath) > 10000:
+        if os.path.exists(temp_cut_filepath) and os.path.getsize(temp_cut_filepath) > 10000:
+            os.replace(temp_cut_filepath, output_filepath)
             return send_from_directory(
                 DOWNLOADS_DIR,
                 output_filename,
                 as_attachment=True,
-                download_name=f"{clean_title}_9-16.mp4",
+                download_name=f"{clean_title}_{aspect_ratio.replace(':', '-')}.mp4",
                 mimetype="video/mp4"
             )
         else:

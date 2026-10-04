@@ -44,16 +44,25 @@ export default function VideoStudioModal({
       ? extractYouTubeId(project.sourceUrl)
       : null);
 
+  const isDirectCandidate = (u) =>
+    typeof u === "string" &&
+    !u.includes("youtube.com/watch") &&
+    !u.includes("youtu.be/") &&
+    !u.includes("twitch.tv/") &&
+    !u.includes("kick.com/") &&
+    (u.startsWith("blob:") ||
+     u.startsWith("data:") ||
+     u.endsWith(".mp4") ||
+     u.endsWith(".webm") ||
+     u.includes("/downloads/") ||
+     u.includes(".m3u8") ||
+     u.includes("googlevideo.com") ||
+     u.includes("cloudfront.net"));
+
   const playableUrl =
-    selectedClip.videoUrl ||
-    project.previewUrl ||
-    (typeof project.sourceUrl === "string" &&
-      (project.sourceUrl.startsWith("blob:") ||
-        project.sourceUrl.endsWith(".mp4") ||
-        project.sourceUrl.endsWith(".webm") ||
-        project.sourceUrl.includes("/downloads/"))
-      ? project.sourceUrl
-      : (project.videoId ? `http://127.0.0.1:5001/downloads/${project.videoId}_preview.mp4` : null));
+    (isDirectCandidate(selectedClip.videoUrl) ? selectedClip.videoUrl : null) ||
+    (isDirectCandidate(project.previewUrl) ? project.previewUrl : null) ||
+    (isDirectCandidate(project.sourceUrl) ? project.sourceUrl : null);
 
   const isDirectVideo = !!playableUrl;
 
@@ -70,7 +79,7 @@ export default function VideoStudioModal({
   const [trimEnd, setTrimEnd] = useState(selectedClip.endTime || project.duration || 15);
 
   // Dynamic Overlay State
-  const [headline, setHeadline] = useState(selectedClip.headline || "STOP SCROLLING 🚨");
+  const [headline, setHeadline] = useState("");
   const [subtitleConfig, setSubtitleConfig] = useState({
     fontFamily: "Plus Jakarta Sans",
     fontSize: 24,
@@ -97,7 +106,7 @@ export default function VideoStudioModal({
     if (selectedClip) {
       setTrimStart(selectedClip.startTime || 0);
       setTrimEnd(selectedClip.endTime || project.duration || 15);
-      setHeadline(selectedClip.headline || "STOP SCROLLING 🚨");
+      setHeadline("");
       if (videoRef.current) {
         videoRef.current.currentTime = selectedClip.startTime || 0;
       }
@@ -183,8 +192,79 @@ export default function VideoStudioModal({
   // Real Video Export Flow
   const handleStartExport = async () => {
     setIsExporting(true);
-    setExportProgress(0);
+    setExportProgress(15);
     setExportedResult(null);
+
+    const cleanTitle = (selectedClip.title || project.title || "vizard-clip").replace(/[^a-zA-Z0-9_-]/g, "_");
+    const ytUrl = project.youtubeId
+      ? `https://www.youtube.com/watch?v=${project.youtubeId}`
+      : (typeof project.sourceUrl === "string" && project.sourceUrl.startsWith("http") ? project.sourceUrl : "");
+
+    if (ytUrl) {
+      try {
+        setExportProgress(35);
+        const res = await fetch("http://127.0.0.1:5001/api/download_clip", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            url: ytUrl,
+            videoId: project.youtubeId || project.videoId || selectedClip.videoId || "",
+            startTime: trimStart,
+            endTime: trimEnd,
+            aspectRatio: aspectRatio,
+            title: cleanTitle,
+            headline: "",
+            subtitles: project.transcript || selectedClip.transcript || []
+          })
+        });
+
+        if (res.ok) {
+          setExportProgress(85);
+          const blob = await res.blob();
+          if (blob.size > 20000) {
+            const blobUrl = URL.createObjectURL(blob);
+            const sizeMb = (blob.size / (1024 * 1024)).toFixed(1);
+
+            const result = {
+              url: blobUrl,
+              blob: blob,
+              formattedSize: `${sizeMb} MB`,
+              extension: "mp4"
+            };
+
+            setExportProgress(100);
+            setExportedResult(result);
+            setIsExporting(false);
+
+            confetti({
+              particleCount: 100,
+              spread: 70,
+              origin: { y: 0.6 }
+            });
+
+            const newExportedItem = {
+              id: `exp-${Date.now()}`,
+              title: selectedClip.title || project.title,
+              sourceProjectTitle: project.title,
+              videoUrl: blobUrl,
+              aspectRatio: aspectRatio,
+              duration: formatTime(trimEnd - trimStart),
+              fileSize: `${sizeMb} MB`,
+              viralScore: selectedClip.viralScore || 95,
+              exportedAt: new Date().toISOString(),
+              style: subtitleConfig.preset,
+              status: "Exported",
+              views: "0",
+              shares: "0"
+            };
+            onSaveExportedClip(newExportedItem);
+            return;
+          }
+        }
+      } catch (srvErr) {
+        console.warn("Studio server export fallback:", srvErr);
+      }
+    }
 
     try {
       const result = await exportVideoClip({
@@ -199,7 +279,7 @@ export default function VideoStudioModal({
         aspectRatio: aspectRatio,
         subtitles: project.transcript || [],
         subtitleConfig: subtitleConfig,
-        headline: headline,
+        headline: "",
         brandKit: brandKit,
         onProgress: (p) => setExportProgress(p)
       });

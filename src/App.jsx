@@ -170,7 +170,11 @@ export default function App() {
         status: "Completed",
         transcript: res.transcript || [],
         clips: res.clips || [],
-        metadata: res.metadata || {}
+        isLive: Boolean(res.isLive || options.isLive || res.metadata?.isLive),
+        metadata: {
+          ...(res.metadata || {}),
+          isLive: Boolean(res.isLive || options.isLive || res.metadata?.isLive)
+        }
       };
 
       setProjects((prev) => [newProject, ...prev]);
